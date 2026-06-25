@@ -22,14 +22,15 @@ from dolfinx.mesh import meshtags
 comm = MPI.COMM_WORLD
 degree = 1
 
-n = 15
+n = 20
 domain = create_unit_cube(MPI.COMM_WORLD, n, n, n, cell_type=CellType.hexahedron)
 
 facet_dim = domain.topology.dim - 1
 
 DG = fem.functionspace(domain, ("DG", 0))
+alpha_value = 1.0
 alpha = Function(DG)
-alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+alpha.interpolate(lambda x: np.where(x[0] <= 0.5, alpha_value, alpha_value))
 beta = Function(DG)
 
 size_beta = 4.0
@@ -41,44 +42,22 @@ beta.interpolate(
         (np.abs(x[0] - 0.5) < beta_loc + eps) &
         (np.abs(x[1] - 0.5) < beta_loc + eps) &
         (np.abs(x[2] - 0.5) < beta_loc + eps),
-        0.0, 1.0
+        1.0, 0.0
     )
 )
 
 num_cells = domain.topology.index_map(domain.topology.dim).size_local
 cell_indices = np.arange(num_cells, dtype=np.int32)
-beta_cell_values = beta.x.array.astype(np.int32)
+
+beta_cell_values = beta.x.array[:num_cells].astype(np.int32)
 
 ct = meshtags(domain, domain.topology.dim, cell_indices, beta_cell_values)
-
 with XDMFFile(domain.comm, "mesh.xdmf", "w") as xdmf:
     xdmf.write_mesh(domain)
     xdmf.write_meshtags(ct, domain.geometry)
 
-#%%
 tdim = domain.topology.dim
 fdim = tdim - 1
-
-cell_idx = ct.find(1) # Find cells with beta 1
-cell_to_vertex = domain.topology.connectivity(tdim, 0)
-
-all_vertex_indices = []
-for idx in cell_idx:
-    all_vertex_indices.extend(cell_to_vertex.links(idx))
-unique_vertex_indices = np.unique(all_vertex_indices)
-
-CG = fem.functionspace(domain, ("CG", 1))
-interior_nodes_array = fem.Function(CG)
-
-
-total_dofs_local = CG.dofmap.index_map.size_local
-all_dofs_local = set(range(total_dofs_local))
-
-set_dofs_tag_1 = set(unique_vertex_indices)
-set_dofs_tag_0 = all_dofs_local - set_dofs_tag_1
-dofs_tag_0 = np.array(sorted(set_dofs_tag_0), dtype=np.int32)
-
-interior_nodes_array.x.array[dofs_tag_0] = 1.0
 
 facets = locate_entities_boundary(
     domain, dim=(domain.topology.dim - 1), marker=boundary_marker
@@ -106,7 +85,6 @@ dofs = locate_dofs_topological(V=A_space, entity_dim=fdim, entities=facets)
 u_bc = Function(A_space)
 bc = dirichletbc(u_bc, dofs)
 
-
 # Solver steps
 
 A_mat = assemble_matrix(a, bcs=[bc])
@@ -120,18 +98,17 @@ petsc.set_bc(b, [bc])
 uh = fem.Function(A_space)
 
 ams_opts = {
-    "ksp_atol": 1e-12,
-    "ksp_rtol": 1e-12,
-    "ksp_type": "fgmres",
+    "ksp_atol": 1e-10,
+    "ksp_rtol": 1e-10,
+    "ksp_type": "cg",
     "ksp_monitor_true_residual": None,
-    # "ksp_gmres_restart": 300,
     "pc_hypre_ams_cycle_type": 13,
     "pc_hypre_ams_tol": 0.0, # Default is 1e-6 but we set it to 0.0 for AMS to be used as preconditioner
     "pc_hypre_ams_max_iter": 1, #Set to 1 to use AMS as a preconditioner
     "pc_hypre_ams_print_level": 1,
     "pc_hypre_ams_amg_alpha_options": "10,1,6,6,4",
     "pc_hypre_ams_amg_beta_options": "10,1,6,6,4",
-    "pc_hypre_ams_projection_frequency": 5,
+    "pc_hypre_ams_projection_frequency": 25,
     "pc_hypre_ams_relax_type": 2,
     "pc_hypre_ams_relax_weight": 1.0,
     "pc_hypre_ams_relax_times": 1,
@@ -141,6 +118,7 @@ ams_opts = {
 ksp = PETSc.KSP().create(domain.comm)
 ksp.setOperators(A_mat)
 ksp.setOptionsPrefix(f"ksp_{id(ksp)}")
+ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
 opts = PETSc.Options()
 option_prefix = ksp.getOptionsPrefix()
@@ -157,16 +135,31 @@ G = discrete_gradient(V_CG._cpp_object, A_space._cpp_object)
 G.assemble()
 pc.setHYPREDiscreteGradient(G)
 
-#%%
-N = len(interior_nodes_array.x.array)
-interior_nodes_vector = PETSc.Vec().create(comm=domain.comm)
-interior_nodes_vector.setSizes(N)
-interior_nodes_vector.setUp()
+V_interior = fem.functionspace(domain, ("CG", degree))
+interior_nodes_array = fem.Function(V_interior)
 
-interior_nodes_vector.setValues(range(N), interior_nodes_array.x.array)
-interior_nodes_vector.assemble()
+interior_nodes_array.x.array[:] = 1.0
+interior_nodes_array.x.scatter_forward()
 
-pc.setHYPREAMSSetInteriorNodes(interior_nodes_vector)
+dofmap = V_interior.dofmap
+num_dofs_per_cell = dofmap.dof_layout.num_dofs
+cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+
+tagged_cells = ct.find(1)# Conductive tags
+
+tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
+unique_dofs = np.unique(tagged_cell_dofs)
+
+interior_nodes_array.x.array[unique_dofs] = 0.0
+interior_nodes_array.x.scatter_forward()
+
+pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+
+# #Export interior nodes to XDMF for visualization
+# with XDMFFile(domain.comm, "interior_nodes.xdmf", "w") as xdmf:
+#     xdmf.write_mesh(domain)
+#     xdmf.write_function(interior_nodes_array)
+
 
 if degree == 1:
     cvec_0 = Function(A_space)
@@ -207,12 +200,12 @@ ksp.solve(b, uh.x.petsc_vec)
 
 # Output to bp
 
-X = fem.functionspace(domain, ("Discontinuous Lagrange", degree + 1, (domain.geometry.dim,)))
-A_vis = fem.Function(X)
-A_vis.interpolate(uh)
+# X = fem.functionspace(domain, ("Discontinuous Lagrange", degree, (domain.geometry.dim,)))
+# A_vis = fem.Function(X)
+# A_vis.interpolate(uh)
 
-A_file = VTXWriter(domain.comm, "A.bp", A_vis, "BP4")
-A_file.write(0.0)
+# A_file = VTXWriter(domain.comm, "A.bp", A_vis, "BP4")
+# A_file.write(0.0)
 
 
 res = A_mat * uh.x.petsc_vec - b
@@ -225,3 +218,8 @@ reason = ksp.getConvergedReason()
 par_print(comm, f"Convergence reason: {reason}")
 
 
+print("A_mat norm:", A_mat.norm())
+print("b norm:", b.norm())
+print("G.norm:", G.norm())
+print("uh.x.norm():", np.linalg.norm(uh.x.array))
+# %%
