@@ -39,21 +39,30 @@ size_beta = 4.0
 beta_loc = size_beta/n
 eps = 1e-12
 
+beta_non_conductive_value = 0.0
+
 beta.interpolate(
     lambda x: np.where(
         (np.abs(x[0] - 0.5) < beta_loc + eps) &
         (np.abs(x[1] - 0.5) < beta_loc + eps) &
         (np.abs(x[2] - 0.5) < beta_loc + eps),
-        1.0, 0.0
+        1.0, beta_non_conductive_value
     )
 )
 
 num_cells = domain.topology.index_map(domain.topology.dim).size_local
 cell_indices = np.arange(num_cells, dtype=np.int32)
 
-beta_cell_values = beta.x.array[:num_cells].astype(np.int32)
+beta_cell_values = beta.x.array[:num_cells]
 
-ct = meshtags(domain, domain.topology.dim, cell_indices, beta_cell_values)
+has_zero_beta_region = domain.comm.allreduce(
+    bool(np.any(beta_cell_values == 0)), op=MPI.LOR
+)
+
+beta_tags = (beta_cell_values > 0.5).astype(np.int32)
+
+
+ct = meshtags(domain, domain.topology.dim, cell_indices, beta_tags)
 with XDMFFile(domain.comm, "mesh.xdmf", "w") as xdmf:
     xdmf.write_mesh(domain)
     xdmf.write_meshtags(ct, domain.geometry)
@@ -64,6 +73,33 @@ fdim = tdim - 1
 facets = locate_entities_boundary(
     domain, dim=(domain.topology.dim - 1), marker=boundary_marker
 )
+
+def set_interior_nodes(domain, ct, facets, fdim, degree, pc):
+    V_interior = fem.functionspace(domain, ("CG", degree))
+    interior_nodes_array = fem.Function(V_interior)
+
+    interior_nodes_array.x.array[:] = 1.0
+    interior_nodes_array.x.scatter_forward()
+
+    dofmap = V_interior.dofmap
+    num_dofs_per_cell = dofmap.dof_layout.num_dofs
+    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+
+    tagged_cells = ct.find(1)  # Conductive tags
+
+    tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
+    unique_dofs = np.unique(tagged_cell_dofs)
+
+    interior_nodes_array.x.array[unique_dofs] = 0.0
+
+    # Exclude the outer domain boundary from the interior node set
+    boundary_dofs = locate_dofs_topological(V=V_interior, entity_dim=fdim, entities=facets)
+    interior_nodes_array.x.array[boundary_dofs] = 0.0
+
+    interior_nodes_array.x.scatter_forward()
+
+    pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+
 
 nedelec_elem = element("N1curl", domain.basix_cell(), degree)
 A_space = fem.functionspace(domain, nedelec_elem)
@@ -142,35 +178,9 @@ with Timer("Setup: Preconditioner") as timer_pc:
     G.assemble()
     pc.setHYPREDiscreteGradient(G)
 
-    V_interior = fem.functionspace(domain, ("CG", degree))
-    interior_nodes_array = fem.Function(V_interior)
-
-    interior_nodes_array.x.array[:] = 1.0
-    interior_nodes_array.x.scatter_forward()
-
-    dofmap = V_interior.dofmap
-    num_dofs_per_cell = dofmap.dof_layout.num_dofs
-    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
-
-    tagged_cells = ct.find(1)# Conductive tags
-
-    tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
-    unique_dofs = np.unique(tagged_cell_dofs)
-
-    interior_nodes_array.x.array[unique_dofs] = 0.0
-
-    # Exclude the outer domain boundary from the interior node set
-    boundary_dofs = locate_dofs_topological(V=V_interior, entity_dim=fdim, entities=facets)
-    interior_nodes_array.x.array[boundary_dofs] = 0.0
-
-    interior_nodes_array.x.scatter_forward()
-
-    pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
-
-    # #Export interior nodes to XDMF for visualization
-    # with XDMFFile(domain.comm, "interior_nodes.xdmf", "w") as xdmf:
-    #     xdmf.write_mesh(domain)
-    #     xdmf.write_function(interior_nodes_array)
+    if has_zero_beta_region:
+        print("Setting interior nodes for AMS preconditioner due to zero beta region.")
+        set_interior_nodes(domain, ct, facets, fdim, degree, pc)
 
 
     if degree == 1:
@@ -233,19 +243,20 @@ reason = ksp.getConvergedReason()
 par_print(comm, f"Convergence reason: {reason}")
 
 
-print("A_mat norm:", A_mat.norm())
-print("b norm:", b.norm())
-print("G.norm:", G.norm())
-print("uh.x.norm():", np.linalg.norm(uh.x.array))
-
 if comm.rank == 0:
     timings = {
+        "zero_beta_region": has_zero_beta_region,
         "assemble_matrix": assembly_time,
         "assemble_rhs": assembly_time_rhs,
         "assemble_preconditioner": pc_assembly_time,
         "solve": solve_time,
     }
-    
-with open("timings.json", "w") as f:
-    json.dump(timings, f, indent=4)
+
+if has_zero_beta_region:
+    with open("timings_zero_beta.json", "w") as f:
+        json.dump(timings, f, indent=4)
+else:
+    with open("timings.json", "w") as f:
+        json.dump(timings, f, indent=4)
+
 # %%
