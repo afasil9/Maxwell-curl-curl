@@ -108,7 +108,7 @@ ams_opts = {
     "pc_hypre_ams_print_level": 1,
     "pc_hypre_ams_amg_alpha_options": "10,1,6,6,4",
     "pc_hypre_ams_amg_beta_options": "10,1,6,6,4",
-    "pc_hypre_ams_projection_frequency": 25,
+    "pc_hypre_ams_projection_frequency": 1,
     "pc_hypre_ams_relax_type": 2,
     "pc_hypre_ams_relax_weight": 1.0,
     "pc_hypre_ams_relax_times": 1,
@@ -151,6 +151,11 @@ tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
 unique_dofs = np.unique(tagged_cell_dofs)
 
 interior_nodes_array.x.array[unique_dofs] = 0.0
+
+# Exclude the outer domain boundary from the interior node set
+boundary_dofs = locate_dofs_topological(V=V_interior, entity_dim=fdim, entities=facets)
+interior_nodes_array.x.array[boundary_dofs] = 0.0
+
 interior_nodes_array.x.scatter_forward()
 
 pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
