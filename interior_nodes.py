@@ -1,4 +1,5 @@
 #%%
+import json
 from mpi4py import MPI
 from dolfinx import fem
 from dolfinx.mesh import create_unit_cube, locate_entities_boundary, CellType
@@ -18,6 +19,7 @@ from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
 from utils import boundary_marker, par_print
 from dolfinx.io import XDMFFile, VTXWriter
 from dolfinx.mesh import meshtags
+from dolfinx.common import Timer
 
 comm = MPI.COMM_WORLD
 degree = 1
@@ -87,13 +89,17 @@ bc = dirichletbc(u_bc, dofs)
 
 # Solver steps
 
-A_mat = assemble_matrix(a, bcs=[bc])
-A_mat.assemble()
+with Timer("Setup: Assembling system") as a_mat_timer:
+    A_mat = assemble_matrix(a, bcs=[bc])
+    A_mat.assemble()
+assembly_time = a_mat_timer.elapsed().total_seconds()
 
-b = petsc.assemble_vector(L)
-petsc.apply_lifting(b, [a], bcs=[[bc]])
-b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-petsc.set_bc(b, [bc])
+with Timer("Setup: Assembling RHS") as rhs_timer:
+    b = petsc.assemble_vector(L)
+    petsc.apply_lifting(b, [a], bcs=[[bc]])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    petsc.set_bc(b, [bc])
+assembly_time_rhs = rhs_timer.elapsed().total_seconds()
 
 uh = fem.Function(A_space)
 
@@ -115,93 +121,97 @@ ams_opts = {
     "pc_hypre_ams_omega": 1.0,
 }
 
-ksp = PETSc.KSP().create(domain.comm)
-ksp.setOperators(A_mat)
-ksp.setOptionsPrefix(f"ksp_{id(ksp)}")
-ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+with Timer("Setup: Preconditioner") as timer_pc:
+    ksp = PETSc.KSP().create(domain.comm)
+    ksp.setOperators(A_mat)
+    ksp.setOptionsPrefix(f"ksp_{id(ksp)}")
+    ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
-opts = PETSc.Options()
-option_prefix = ksp.getOptionsPrefix()
-opts.prefixPush(option_prefix)
-for option, value in ams_opts.items():
-    opts[option] = value
-opts.prefixPop()
+    opts = PETSc.Options()
+    option_prefix = ksp.getOptionsPrefix()
+    opts.prefixPush(option_prefix)
+    for option, value in ams_opts.items():
+        opts[option] = value
+    opts.prefixPop()
 
-pc = ksp.getPC()
-pc.setType("hypre")
-pc.setHYPREType("ams")
+    pc = ksp.getPC()
+    pc.setType("hypre")
+    pc.setHYPREType("ams")
 
-G = discrete_gradient(V_CG._cpp_object, A_space._cpp_object)
-G.assemble()
-pc.setHYPREDiscreteGradient(G)
+    G = discrete_gradient(V_CG._cpp_object, A_space._cpp_object)
+    G.assemble()
+    pc.setHYPREDiscreteGradient(G)
 
-V_interior = fem.functionspace(domain, ("CG", degree))
-interior_nodes_array = fem.Function(V_interior)
+    V_interior = fem.functionspace(domain, ("CG", degree))
+    interior_nodes_array = fem.Function(V_interior)
 
-interior_nodes_array.x.array[:] = 1.0
-interior_nodes_array.x.scatter_forward()
+    interior_nodes_array.x.array[:] = 1.0
+    interior_nodes_array.x.scatter_forward()
 
-dofmap = V_interior.dofmap
-num_dofs_per_cell = dofmap.dof_layout.num_dofs
-cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
+    dofmap = V_interior.dofmap
+    num_dofs_per_cell = dofmap.dof_layout.num_dofs
+    cell_dofs = dofmap.list.reshape(-1, num_dofs_per_cell)
 
-tagged_cells = ct.find(1)# Conductive tags
+    tagged_cells = ct.find(1)# Conductive tags
 
-tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
-unique_dofs = np.unique(tagged_cell_dofs)
+    tagged_cell_dofs = cell_dofs[tagged_cells].flatten()
+    unique_dofs = np.unique(tagged_cell_dofs)
 
-interior_nodes_array.x.array[unique_dofs] = 0.0
+    interior_nodes_array.x.array[unique_dofs] = 0.0
 
-# Exclude the outer domain boundary from the interior node set
-boundary_dofs = locate_dofs_topological(V=V_interior, entity_dim=fdim, entities=facets)
-interior_nodes_array.x.array[boundary_dofs] = 0.0
+    # Exclude the outer domain boundary from the interior node set
+    boundary_dofs = locate_dofs_topological(V=V_interior, entity_dim=fdim, entities=facets)
+    interior_nodes_array.x.array[boundary_dofs] = 0.0
 
-interior_nodes_array.x.scatter_forward()
+    interior_nodes_array.x.scatter_forward()
 
-pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
+    pc.setHYPREAMSSetInteriorNodes(interior_nodes_array.x.petsc_vec)
 
-# #Export interior nodes to XDMF for visualization
-# with XDMFFile(domain.comm, "interior_nodes.xdmf", "w") as xdmf:
-#     xdmf.write_mesh(domain)
-#     xdmf.write_function(interior_nodes_array)
+    # #Export interior nodes to XDMF for visualization
+    # with XDMFFile(domain.comm, "interior_nodes.xdmf", "w") as xdmf:
+    #     xdmf.write_mesh(domain)
+    #     xdmf.write_function(interior_nodes_array)
 
 
-if degree == 1:
-    cvec_0 = Function(A_space)
-    cvec_0.interpolate(
-        lambda x: np.vstack(
-            (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
+    if degree == 1:
+        cvec_0 = Function(A_space)
+        cvec_0.interpolate(
+            lambda x: np.vstack(
+                (np.ones_like(x[0]), np.zeros_like(x[0]), np.zeros_like(x[0]))
+            )
         )
-    )
-    cvec_1 = Function(A_space)
-    cvec_1.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
+        cvec_1 = Function(A_space)
+        cvec_1.interpolate(
+            lambda x: np.vstack(
+                (np.zeros_like(x[0]), np.ones_like(x[0]), np.zeros_like(x[0]))
+            )
         )
-    )
-    cvec_2 = Function(A_space)
-    cvec_2.interpolate(
-        lambda x: np.vstack(
-            (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
+        cvec_2 = Function(A_space)
+        cvec_2.interpolate(
+            lambda x: np.vstack(
+                (np.zeros_like(x[0]), np.zeros_like(x[0]), np.ones_like(x[0]))
+            )
         )
-    )
-    pc.setHYPRESetEdgeConstantVectors(
-        cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
-    )
-else:
-    Vec_CG = fem.functionspace(domain, ("CG", degree, (domain.geometry.dim,)))
-    Pi = interpolation_matrix(Vec_CG._cpp_object, A_space._cpp_object)
-    Pi.assemble()
+        pc.setHYPRESetEdgeConstantVectors(
+            cvec_0.x.petsc_vec, cvec_1.x.petsc_vec, cvec_2.x.petsc_vec
+        )
+    else:
+        Vec_CG = fem.functionspace(domain, ("CG", degree, (domain.geometry.dim,)))
+        Pi = interpolation_matrix(Vec_CG._cpp_object, A_space._cpp_object)
+        Pi.assemble()
 
-    # Attach discrete gradient to preconditioner
-    pc.setHYPRESetInterpolations(domain.geometry.dim, None, None, Pi, None)
+        # Attach discrete gradient to preconditioner
+        pc.setHYPRESetInterpolations(domain.geometry.dim, None, None, Pi, None)
 
+    ksp.setFromOptions()
+    ksp.setUp()
+    pc.setUp()
 
-ksp.setFromOptions()
-ksp.setUp()
-pc.setUp()
+pc_assembly_time = timer_pc.elapsed().total_seconds()
 
-ksp.solve(b, uh.x.petsc_vec)
+with Timer("Solve") as timer_solve:
+    ksp.solve(b, uh.x.petsc_vec)
+solve_time = timer_solve.elapsed().total_seconds()
 
 # Output to bp
 
@@ -227,4 +237,15 @@ print("A_mat norm:", A_mat.norm())
 print("b norm:", b.norm())
 print("G.norm:", G.norm())
 print("uh.x.norm():", np.linalg.norm(uh.x.array))
+
+if comm.rank == 0:
+    timings = {
+        "assemble_matrix": assembly_time,
+        "assemble_rhs": assembly_time_rhs,
+        "assemble_preconditioner": pc_assembly_time,
+        "solve": solve_time,
+    }
+    
+with open("timings.json", "w") as f:
+    json.dump(timings, f, indent=4)
 # %%
