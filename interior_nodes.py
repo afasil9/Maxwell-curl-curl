@@ -1,6 +1,11 @@
 #%%
 import json
+import sys
 from mpi4py import MPI
+import petsc4py
+petsc4py.init(sys.argv)
+from petsc4py import PETSc
+PETSc.Log.begin()
 from dolfinx import fem
 from dolfinx.mesh import create_unit_cube, locate_entities_boundary, CellType
 from dolfinx.fem import (
@@ -14,7 +19,6 @@ from dolfinx.fem.petsc import assemble_matrix
 import numpy as np
 from ufl import curl, TrialFunction, TestFunction, inner, dx, as_vector
 from basix.ufl import element
-from petsc4py import PETSc
 from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
 from utils import boundary_marker, par_print
 from dolfinx.io import XDMFFile, VTXWriter
@@ -63,9 +67,9 @@ beta_tags = (beta_cell_values > 0.5).astype(np.int32)
 
 
 ct = meshtags(domain, domain.topology.dim, cell_indices, beta_tags)
-with XDMFFile(domain.comm, "mesh.xdmf", "w") as xdmf:
-    xdmf.write_mesh(domain)
-    xdmf.write_meshtags(ct, domain.geometry)
+# with XDMFFile(domain.comm, "mesh.xdmf", "w") as xdmf:
+#     xdmf.write_mesh(domain)
+#     xdmf.write_meshtags(ct, domain.geometry)
 
 tdim = domain.topology.dim
 fdim = tdim - 1
@@ -143,14 +147,14 @@ ams_opts = {
     "ksp_atol": 1e-10,
     "ksp_rtol": 1e-10,
     "ksp_type": "cg",
-    "ksp_monitor_true_residual": None,
+    # "ksp_monitor_true_residual": None,
     "pc_hypre_ams_cycle_type": 13,
     "pc_hypre_ams_tol": 0.0, # Default is 1e-6 but we set it to 0.0 for AMS to be used as preconditioner
     "pc_hypre_ams_max_iter": 1, #Set to 1 to use AMS as a preconditioner
     "pc_hypre_ams_print_level": 1,
     "pc_hypre_ams_amg_alpha_options": "10,1,6,6,4",
     "pc_hypre_ams_amg_beta_options": "10,1,6,6,4",
-    "pc_hypre_ams_projection_frequency": 1,
+    "pc_hypre_ams_projection_frequency": 100,
     "pc_hypre_ams_relax_type": 2,
     "pc_hypre_ams_relax_weight": 1.0,
     "pc_hypre_ams_relax_times": 1,
@@ -164,6 +168,8 @@ with Timer("Setup: Preconditioner") as timer_pc:
     ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
     opts = PETSc.Options()
+    opts["log_view"] = "ascii:log.txt"
+
     option_prefix = ksp.getOptionsPrefix()
     opts.prefixPush(option_prefix)
     for option, value in ams_opts.items():
@@ -214,13 +220,25 @@ with Timer("Setup: Preconditioner") as timer_pc:
         pc.setHYPRESetInterpolations(domain.geometry.dim, None, None, Pi, None)
 
     ksp.setFromOptions()
+    pc.setFromOptions()
+
+    st_setup = PETSc.Log.Stage("PCSetUp")
+    st_setup.push()
     ksp.setUp()
     pc.setUp()
+    st_setup.pop()
 
 pc_assembly_time = timer_pc.elapsed().total_seconds()
 
+info = G.getInfo()
+print("G rows:", G.getSize()[0], "nnz:", info['nz_used'], "avg/row:", info['nz_used']/G.getSize()[0])
+
+#%%
 with Timer("Solve") as timer_solve:
+    st_solve = PETSc.Log.Stage("KSPSolve")
+    st_solve.push()
     ksp.solve(b, uh.x.petsc_vec)
+    st_solve.pop()
 solve_time = timer_solve.elapsed().total_seconds()
 
 # Output to bp
@@ -250,6 +268,7 @@ if comm.rank == 0:
         "assemble_rhs": assembly_time_rhs,
         "assemble_preconditioner": pc_assembly_time,
         "solve": solve_time,
+        "iterations": iterations,
     }
 
 if has_zero_beta_region:
