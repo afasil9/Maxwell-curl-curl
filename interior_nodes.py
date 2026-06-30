@@ -24,6 +24,9 @@ from utils import boundary_marker, par_print
 from dolfinx.io import XDMFFile, VTXWriter
 from dolfinx.mesh import meshtags
 from dolfinx.common import Timer
+from petsc4py import PETSc
+import scipy.sparse as sp
+import numpy as np
 
 comm = MPI.COMM_WORLD
 degree = 1
@@ -182,7 +185,20 @@ with Timer("Setup: Preconditioner") as timer_pc:
 
     G = discrete_gradient(V_CG._cpp_object, A_space._cpp_object)
     G.assemble()
-    pc.setHYPREDiscreteGradient(G)
+    # pc.setHYPREDiscreteGradient(G)
+
+    G.assemble()
+    ai, aj, av = G.getValuesCSR()
+    M = sp.csr_matrix((av, aj, ai), shape=G.getSize())
+    M.data[np.abs(M.data) < 1e-12] = 0.0
+    M.eliminate_zeros()                       # now exactly 2/row
+    print("avg nnz/row:", M.nnz / M.shape[0])
+
+    G_clean = PETSc.Mat().createAIJ(size=M.shape,
+                                    csr=(M.indptr, M.indices, M.data),
+                                    comm=G.comm)
+    G_clean.assemble()
+    pc.setHYPREDiscreteGradient(G_clean)
 
     if has_zero_beta_region:
         print("Setting interior nodes for AMS preconditioner due to zero beta region.")
