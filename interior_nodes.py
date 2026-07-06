@@ -1,37 +1,35 @@
-#%%
 import json
 import sys
-from mpi4py import MPI
+
+import numpy as np
 import petsc4py
-petsc4py.init(sys.argv)
-from petsc4py import PETSc
-PETSc.Log.begin()
+import scipy.sparse as sp
+from basix.ufl import element
 from dolfinx import fem
-from dolfinx.mesh import create_unit_cube, locate_entities_boundary, CellType
+from dolfinx.common import Timer
 from dolfinx.fem import (
     Function,
     dirichletbc,
-    locate_dofs_topological,
     form,
+    locate_dofs_topological,
     petsc,
 )
-from dolfinx.fem.petsc import assemble_matrix
-import numpy as np
-from ufl import curl, TrialFunction, TestFunction, inner, dx, as_vector
-from basix.ufl import element
-from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
-from utils import boundary_marker, par_print
-from dolfinx.io import XDMFFile, VTXWriter
-from dolfinx.mesh import meshtags
-from dolfinx.common import Timer
+from dolfinx.fem.petsc import assemble_matrix, discrete_gradient, interpolation_matrix
+from dolfinx.io import VTXWriter, XDMFFile
+from dolfinx.mesh import CellType, create_unit_cube, locate_entities_boundary, meshtags
+from mpi4py import MPI
 from petsc4py import PETSc
-import scipy.sparse as sp
-import numpy as np
+from ufl import TestFunction, TrialFunction, as_vector, curl, dx, inner
+
+from utils import L2_norm, boundary_marker, par_print
+
+petsc4py.init(sys.argv)
+PETSc.Log.begin()
 
 comm = MPI.COMM_WORLD
 degree = 1
 
-n = 20
+n = 10
 domain = create_unit_cube(MPI.COMM_WORLD, n, n, n, cell_type=CellType.hexahedron)
 
 facet_dim = domain.topology.dim - 1
@@ -131,12 +129,14 @@ u_bc = Function(A_space)
 bc = dirichletbc(u_bc, dofs)
 
 # Solver steps
+par_print(comm, "Assembling system")
 
 with Timer("Setup: Assembling system") as a_mat_timer:
     A_mat = assemble_matrix(a, bcs=[bc])
     A_mat.assemble()
 assembly_time = a_mat_timer.elapsed().total_seconds()
 
+par_print(comm, "Assembling RHS")
 with Timer("Setup: Assembling RHS") as rhs_timer:
     b = petsc.assemble_vector(L)
     petsc.apply_lifting(b, [a], bcs=[[bc]])
@@ -147,11 +147,11 @@ assembly_time_rhs = rhs_timer.elapsed().total_seconds()
 uh = fem.Function(A_space)
 
 ams_opts = {
-    "ksp_atol": 1e-10,
-    "ksp_rtol": 1e-10,
+    "ksp_atol": 1e-8,
+    "ksp_rtol": 1e-8,
     "ksp_type": "cg",
-    # "ksp_monitor_true_residual": None,
-    "pc_hypre_ams_cycle_type": 13,
+    "ksp_monitor_true_residual": None,
+    "pc_hypre_ams_cycle_type": 1,
     "pc_hypre_ams_tol": 0.0, # Default is 1e-6 but we set it to 0.0 for AMS to be used as preconditioner
     "pc_hypre_ams_max_iter": 1, #Set to 1 to use AMS as a preconditioner
     "pc_hypre_ams_print_level": 1,
@@ -164,6 +164,7 @@ ams_opts = {
     "pc_hypre_ams_omega": 1.0,
 }
 
+par_print(comm, "Setting up preconditioner")
 with Timer("Setup: Preconditioner") as timer_pc:
     ksp = PETSc.KSP().create(domain.comm)
     ksp.setOperators(A_mat)
@@ -171,7 +172,12 @@ with Timer("Setup: Preconditioner") as timer_pc:
     ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
     opts = PETSc.Options()
-    opts["log_view"] = "ascii:log.txt"
+
+    if has_zero_beta_region:
+        opts["log_view"] = "ascii:log.txt"
+    else:
+        opts["log_view"] = "ascii:log_no_zero_beta.txt"
+
 
     option_prefix = ksp.getOptionsPrefix()
     opts.prefixPush(option_prefix)
@@ -183,9 +189,10 @@ with Timer("Setup: Preconditioner") as timer_pc:
     pc.setType("hypre")
     pc.setHYPREType("ams")
 
-    G = discrete_gradient(V_CG._cpp_object, A_space._cpp_object)
-    G.assemble()
-    # pc.setHYPREDiscreteGradient(G)
+    G = discrete_gradient(V_CG, A_space)
+
+    cols, vals = G.getRow(100)
+    print("entries:", len(vals), " true nonzeros:", int(np.count_nonzero(np.abs(vals) > 1e-12)))
 
     G.assemble()
     ai, aj, av = G.getValuesCSR()
@@ -201,7 +208,7 @@ with Timer("Setup: Preconditioner") as timer_pc:
     pc.setHYPREDiscreteGradient(G_clean)
 
     if has_zero_beta_region:
-        print("Setting interior nodes for AMS preconditioner due to zero beta region.")
+        par_print(comm, "Setting interior nodes for AMS preconditioner due to zero beta region.")
         set_interior_nodes(domain, ct, facets, fdim, degree, pc)
 
 
@@ -229,7 +236,7 @@ with Timer("Setup: Preconditioner") as timer_pc:
         )
     else:
         Vec_CG = fem.functionspace(domain, ("CG", degree, (domain.geometry.dim,)))
-        Pi = interpolation_matrix(Vec_CG._cpp_object, A_space._cpp_object)
+        Pi = interpolation_matrix(Vec_CG, A_space)
         Pi.assemble()
 
         # Attach discrete gradient to preconditioner
@@ -247,9 +254,8 @@ with Timer("Setup: Preconditioner") as timer_pc:
 pc_assembly_time = timer_pc.elapsed().total_seconds()
 
 info = G.getInfo()
-print("G rows:", G.getSize()[0], "nnz:", info['nz_used'], "avg/row:", info['nz_used']/G.getSize()[0])
+par_print(comm, f"G rows: {G.getSize()[0]}, nnz: {info['nz_used']}, avg/row: {info['nz_used']/G.getSize()[0]}")
 
-#%%
 with Timer("Solve") as timer_solve:
     st_solve = PETSc.Log.Stage("KSPSolve")
     st_solve.push()
@@ -275,17 +281,17 @@ par_print(comm, f"Number of iterations: {iterations}")
 
 reason = ksp.getConvergedReason()
 par_print(comm, f"Convergence reason: {reason}")
+par_print(comm, f"L2 norm of curl uh: {L2_norm(curl(uh))}")
 
 
-if comm.rank == 0:
-    timings = {
-        "zero_beta_region": has_zero_beta_region,
-        "assemble_matrix": assembly_time,
-        "assemble_rhs": assembly_time_rhs,
-        "assemble_preconditioner": pc_assembly_time,
-        "solve": solve_time,
-        "iterations": iterations,
-    }
+timings = {
+    "zero_beta_region": has_zero_beta_region,
+    "assemble_matrix": assembly_time,
+    "assemble_rhs": assembly_time_rhs,
+    "assemble_preconditioner": pc_assembly_time,
+    "solve": solve_time,
+    "iterations": iterations,
+}
 
 if has_zero_beta_region:
     with open("timings_zero_beta.json", "w") as f:
@@ -294,4 +300,3 @@ else:
     with open("timings.json", "w") as f:
         json.dump(timings, f, indent=4)
 
-# %%
