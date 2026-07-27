@@ -1,4 +1,4 @@
-from ufl import cos, pi, as_vector
+from ufl import as_vector, cos, pi
 
 
 def sinusodial(x):
