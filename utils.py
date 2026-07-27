@@ -27,11 +27,8 @@ def L2_norm(v: Expr):
 
 
 def monitor(ksp, its, rnorm):
-    iteration_count = []
-    residual_norm = []
-    iteration_count.append(its)
-    residual_norm.append(rnorm)
-    print("Iteration: {}, preconditioned residual: {}".format(its, rnorm))
+    """KSP monitor printing the preconditioned residual on rank 0 only"""
+    par_print(ksp.comm.tompi4py(), f"Iteration: {its}, preconditioned residual: {rnorm}")
 
 
 def boundary_marker(x):
