@@ -1,3 +1,4 @@
+#%%
 from mpi4py import MPI
 from dolfinx import fem
 from dolfinx.mesh import create_unit_cube, locate_entities_boundary
@@ -14,9 +15,9 @@ import numpy as np
 from ufl import SpatialCoordinate, curl, TrialFunction, TestFunction, inner, dx
 from basix.ufl import element
 from petsc4py import PETSc
-from dolfinx.cpp.fem.petsc import discrete_gradient, interpolation_matrix
 from utils import boundary_marker, L2_norm, par_print, monitor
 from problems import quadratic, sinusodial
+from dolfinx.fem.petsc import discrete_gradient, interpolation_matrix
 
 comm = MPI.COMM_WORLD
 
@@ -40,7 +41,7 @@ nedelec_elem = element("N1curl", domain.basix_cell(), degree)
 A_space = fem.functionspace(domain, nedelec_elem)
 
 total_dofs = A_space.dofmap.index_map.size_global * A_space.dofmap.index_map_bs
-print("total dofs: ", total_dofs)
+par_print(comm, f"total dofs: {total_dofs}")
 
 A = TrialFunction(A_space)
 v = TestFunction(A_space)
@@ -62,12 +63,10 @@ f = curl(alpha * curl(u_e)) + beta * u_e
 a = form(inner(alpha * curl(A), curl(v)) * dx + inner(beta * A, v) * dx)
 L = form(inner(f, v) * dx)
 
-u_bc_expr = Expression(u_e, A_space.element.interpolation_points())
+u_bc_expr = Expression(u_e, A_space.element.interpolation_points)
 u_bc = Function(A_space)
 u_bc.interpolate(u_bc_expr)
 bc = dirichletbc(u_bc, dofs)
-
-print(L2_norm(u_e))
 
 # Solver steps
 
@@ -100,7 +99,7 @@ ams_opts = {
 # Iterative Solver with Direct LU preconditioner
 
 if case == 1:
-    print("Case 1: Direct Solver")
+    par_print(comm, "Case 1: Direct Solver")
 
     ksp = PETSc.KSP().create(domain.comm)
     ksp.setOperators(A_mat)
@@ -125,9 +124,9 @@ if case == 1:
     pc.setUp()
 
 # Iterative Solver with AMS Preconditioner
-
+#%%
 if case == 2:
-    print("Case 2: Iterative Solver with AMS Preconditioner")
+    par_print(comm, "Case 2: Iterative Solver with AMS Preconditioner")
 
     ksp = PETSc.KSP().create(domain.comm)
     ksp.setOperators(A_mat)
@@ -145,8 +144,8 @@ if case == 2:
     pc.setHYPREType("ams")
 
     # Build discrete gradient
-    V_CG = fem.functionspace(domain, ("CG", degree))._cpp_object
-    G = discrete_gradient(V_CG, A_space._cpp_object)
+    V_CG = fem.functionspace(domain, ("CG", degree))
+    G = discrete_gradient(V_CG, A_space)
     G.assemble()
     pc.setHYPREDiscreteGradient(G)
 
@@ -174,7 +173,7 @@ if case == 2:
         )
     else:
         Vec_CG = fem.functionspace(domain, ("CG", degree, (domain.geometry.dim,)))
-        Pi = interpolation_matrix(Vec_CG._cpp_object, A_space._cpp_object)
+        Pi = interpolation_matrix(Vec_CG, A_space)
         Pi.assemble()
 
         # Attach discrete gradient to preconditioner
@@ -187,7 +186,7 @@ if case == 2:
     pc.setUp()
 
 if case == 3:
-    print("Case 3: Iterative Solver with Direct Preconditioner")
+    par_print(comm, "Case 3: Iterative Solver with Direct Preconditioner")
 
     ksp = PETSc.KSP().create(domain.comm)
     ksp.setOperators(A_mat)
